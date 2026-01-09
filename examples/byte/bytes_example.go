@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/yourusername/fins"
+	"github.com/jianwushu/fins"
 )
 
 func main() {
@@ -174,4 +174,3 @@ func main() {
 
 	fmt.Println("\n字节数组操作示例执行完成")
 }
-

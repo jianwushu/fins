@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/yourusername/fins"
+	"github.com/jianwushu/fins"
 )
 
 func main() {

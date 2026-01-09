@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/yourusername/fins"
+	"github.com/jianwushu/fins"
 )
 
 func main() {
@@ -23,13 +23,13 @@ func main() {
 
 	// 创建重连策略
 	reconnectPolicy := &fins.ReconnectPolicy{
-		EnableAutoReconnect:  true,               // 启用自动重连
-		MaxReconnectAttempts: 0,                  // 0 = 无限重试
-		InitialDelay:         1 * time.Second,    // 初始延迟1秒
-		MaxDelay:             30 * time.Second,   // 最大延迟30秒
-		BackoffFactor:        2.0,                // 指数退避因子
-		ReconnectOnError:     true,               // 读写错误时自动重连
-		HealthCheckInterval:  10 * time.Second,   // 每10秒健康检查
+		EnableAutoReconnect:  true,             // 启用自动重连
+		MaxReconnectAttempts: 0,                // 0 = 无限重试
+		InitialDelay:         1 * time.Second,  // 初始延迟1秒
+		MaxDelay:             30 * time.Second, // 最大延迟30秒
+		BackoffFactor:        2.0,              // 指数退避因子
+		ReconnectOnError:     true,             // 读写错误时自动重连
+		HealthCheckInterval:  10 * time.Second, // 每10秒健康检查
 	}
 
 	// 创建支持自动重连的客户端
@@ -129,4 +129,3 @@ func monitorConnection(client *fins.ReconnectableClient) {
 		fmt.Printf("\r[监控] 连接状态: %s", status)
 	}
 }
-

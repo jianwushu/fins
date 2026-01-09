@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/yourusername/fins"
+	"github.com/jianwushu/fins"
 )
 
 func main() {
@@ -66,7 +66,7 @@ func main() {
 	// 示例3: 使用默认重试策略
 	fmt.Println("\n=== 示例3: 使用默认重试策略 ===")
 	defaultRetryClient := fins.NewRetryableClient(client, nil) // nil使用默认策略
-	
+
 	data, err = defaultRetryClient.ReadMemoryArea(fins.MemAreaD, 300, 5)
 	if err != nil {
 		log.Printf("读取失败: %v", err)
@@ -84,4 +84,3 @@ func main() {
 
 	fmt.Println("\n重试示例执行完成")
 }
-
