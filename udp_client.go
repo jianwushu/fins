@@ -82,8 +82,18 @@ func (c *FinsUDPClient) Close() error {
 	close(c.closeChan)
 
 	if c.conn != nil {
-		return c.conn.Close()
+		c.conn.Close()
+		c.conn = nil
 	}
+
+	// 清理待处理请求
+	for sid, req := range c.pendingReqs {
+		close(req.Response)
+		delete(c.pendingReqs, sid)
+	}
+
+	// 创建新的closeChan，允许重连
+	c.closeChan = make(chan struct{})
 
 	return nil
 }

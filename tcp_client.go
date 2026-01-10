@@ -72,8 +72,12 @@ func (c *FinsTCPClient) Close() error {
 	close(c.closeChan)
 
 	if c.conn != nil {
-		return c.conn.Close()
+		c.conn.Close()
+		c.conn = nil
 	}
+
+	// 创建新的closeChan，允许重连
+	c.closeChan = make(chan struct{})
 
 	return nil
 }
