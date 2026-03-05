@@ -12,6 +12,21 @@ const (
 	TCPMagic = "FINS"
 )
 
+// FINS/TCP 外层命令码（常见取值，部分 PLC 型号可能存在差异）
+//
+// 按本库约定：
+// - 0x00000000：握手请求（Handshake Request，发送客户端 IPv4 或 0.0.0.0）
+// - 0x00000001：握手响应（Handshake Response）
+// - 0x00000002：正常读写帧（承载“内层”FINS 报文；请求/响应命令码相同）
+const (
+	// 握手：请求/响应
+	TCPCommandHandshakeRequest  uint32 = 0x00000000
+	TCPCommandHandshakeResponse uint32 = 0x00000001
+
+	// 正常读写帧（请求/响应同为 0x00000002）
+	TCPCommandFinsFrame uint32 = 0x00000002
+)
+
 // ICF (Information Control Field) 值
 const (
 	ICFNoResponse = 0x00 // 无响应请求
@@ -81,8 +96,8 @@ const (
 
 // 帧头长度
 const (
-	TCPHeaderLength = 20 // TCP帧头长度
-	UDPHeaderLength = 10 // UDP帧头长度
+	TCPHeaderLength = 16 // FINS/TCP 外层头长度（Magic+Length+Command+ErrorCode）
+	UDPHeaderLength = 10 // FINS/UDP（内层FINS）头长度
 )
 
 // 错误码到错误消息的映射

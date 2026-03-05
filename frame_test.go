@@ -3,7 +3,9 @@ package fins
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
+	"time"
 )
 
 func TestBuildUDPFrame(t *testing.T) {
@@ -76,7 +78,8 @@ func TestParseUDPFrame(t *testing.T) {
 }
 
 func TestBuildTCPFrame(t *testing.T) {
-	frame := NewTCPRequestFrame(1, 100, CmdMemoryRead, []byte{0x82, 0x00, 0x64, 0x00, 0x00, 0x01})
+	payload := []byte{0x01, 0x02, 0x03}
+	frame := NewTCPRequestFrame(TCPCommandFinsFrame, payload)
 
 	data, err := BuildTCPFrame(frame)
 	if err != nil {
@@ -88,24 +91,38 @@ func TestBuildTCPFrame(t *testing.T) {
 		t.Errorf("魔数不正确: got %s, want %s", string(data[0:4]), TCPMagic)
 	}
 
-	// 验证长度
+	// 验证长度：Length = Command(4)+Error(4)+Data(N)
 	length := binary.BigEndian.Uint32(data[4:8])
-	if length != uint32(len(data)) {
-		t.Errorf("长度不正确: got %d, want %d", length, len(data))
+	wantLen := uint32(8 + len(payload))
+	if length != wantLen {
+		t.Errorf("长度不正确: got %d, want %d", length, wantLen)
+	}
+
+	// 验证总长度：8 + Length
+	if len(data) != int(8+length) {
+		t.Errorf("总长度不正确: got %d, want %d", len(data), int(8+length))
+	}
+
+	// 验证命令
+	cmd := binary.BigEndian.Uint32(data[8:12])
+	if cmd != TCPCommandFinsFrame {
+		t.Errorf("命令不正确: got 0x%08X, want 0x%08X", cmd, TCPCommandFinsFrame)
 	}
 }
 
 func TestParseTCPFrame(t *testing.T) {
+	payload := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+
 	// 构建测试数据
 	magic := []byte("FINS")
-	data := make([]byte, TCPHeaderLength+2+2)
+	length := uint32(8 + len(payload))
+
+	data := make([]byte, 8+length)
 	copy(data[0:4], magic)
-	binary.BigEndian.PutUint32(data[4:8], uint32(len(data)))
-	binary.BigEndian.PutUint32(data[8:12], 0)
-	binary.BigEndian.PutUint32(data[12:16], 1)
-	binary.BigEndian.PutUint32(data[16:20], 100)
-	binary.BigEndian.PutUint16(data[20:22], CmdMemoryRead)
-	binary.BigEndian.PutUint16(data[22:24], 0)
+	binary.BigEndian.PutUint32(data[4:8], length)
+	binary.BigEndian.PutUint32(data[8:12], TCPCommandFinsFrame)
+	binary.BigEndian.PutUint32(data[12:16], 0)
+	copy(data[16:], payload)
 
 	frame, err := ParseTCPFrame(data)
 	if err != nil {
@@ -116,8 +133,12 @@ func TestParseTCPFrame(t *testing.T) {
 		t.Errorf("魔数不正确: got %s, want %s", string(frame.Magic[:]), TCPMagic)
 	}
 
-	if frame.Command != CmdMemoryRead {
-		t.Errorf("命令码不正确: got 0x%04X, want 0x%04X", frame.Command, CmdMemoryRead)
+	if frame.Command != TCPCommandFinsFrame {
+		t.Errorf("命令不正确: got 0x%08X, want 0x%08X", frame.Command, TCPCommandFinsFrame)
+	}
+
+	if !bytes.Equal(frame.Data, payload) {
+		t.Errorf("payload不正确: got %v, want %v", frame.Data, payload)
 	}
 }
 
@@ -220,5 +241,97 @@ func TestByteAlignment(t *testing.T) {
 					tt.byteCount, wordCount, tt.wantWords)
 			}
 		})
+	}
+}
+
+// ---- helpers for tcp_client.go tests ----
+
+type stubAddr string
+
+func (a stubAddr) Network() string { return "tcp" }
+func (a stubAddr) String() string  { return string(a) }
+
+type stubConn struct {
+	local net.Addr
+}
+
+func (c *stubConn) Read(b []byte) (n int, err error)   { return 0, nil }
+func (c *stubConn) Write(b []byte) (n int, err error)  { return len(b), nil }
+func (c *stubConn) Close() error                       { return nil }
+func (c *stubConn) LocalAddr() net.Addr                { return c.local }
+func (c *stubConn) RemoteAddr() net.Addr               { return stubAddr("192.168.0.10:9600") }
+func (c *stubConn) SetDeadline(t time.Time) error      { return nil }
+func (c *stubConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *stubConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func TestLocalIPv4BytesFromConn(t *testing.T) {
+	conn := &stubConn{local: stubAddr("127.0.0.1:12345")}
+	b, ok := localIPv4BytesFromConn(conn)
+	if !ok {
+		t.Fatalf("expected ok")
+	}
+	if !bytes.Equal(b, []byte{127, 0, 0, 1}) {
+		t.Fatalf("unexpected bytes: %v", b)
+	}
+}
+
+func TestDeriveNodeFromIPv4(t *testing.T) {
+	if n, ok := deriveNodeFromIPv4([]byte{127, 0, 0, 1}); !ok || n != 1 {
+		t.Fatalf("expected node=1 ok=true, got node=%d ok=%v", n, ok)
+	}
+	if _, ok := deriveNodeFromIPv4([]byte{192, 168, 1, 0}); ok {
+		t.Fatalf("expected ok=false for last octet 0")
+	}
+	if _, ok := deriveNodeFromIPv4([]byte{1, 2, 3}); ok {
+		t.Fatalf("expected ok=false for len!=4")
+	}
+}
+
+func TestResolveLocalNode_ConfigZero_HandshakeNonZero(t *testing.T) {
+	conn := &stubConn{local: stubAddr("127.0.0.1:12345")}
+	got := resolveLocalNode(0, 77, conn)
+	if got != 77 {
+		t.Fatalf("expected 77, got %d", got)
+	}
+}
+
+func TestResolveLocalNode_ConfigZero_HandshakeZero_DeriveFromIP(t *testing.T) {
+	conn := &stubConn{local: stubAddr("10.0.0.5:12345")}
+	got := resolveLocalNode(0, 0, conn)
+	if got != 5 {
+		t.Fatalf("expected 5, got %d", got)
+	}
+}
+
+func TestResolveLocalNode_ConfigZero_AllFail_FallbackTo1(t *testing.T) {
+	conn := &stubConn{local: stubAddr("[::1]:12345")}
+	got := resolveLocalNode(0, 0, conn)
+	if got != 1 {
+		t.Fatalf("expected 1, got %d", got)
+	}
+}
+
+func TestResolveLocalNode_ConfigNonZero_ForceDeriveFromIP(t *testing.T) {
+	conn := &stubConn{local: stubAddr("192.168.1.200:12345")}
+	got := resolveLocalNode(9, 77, conn)
+	if got != 200 {
+		t.Fatalf("expected 200, got %d", got)
+	}
+}
+
+func TestResolveLocalNode_ConfigNonZero_DeriveFail_FallbackToConfig(t *testing.T) {
+	conn := &stubConn{local: stubAddr("[::1]:12345")}
+	got := resolveLocalNode(9, 77, conn)
+	if got != 9 {
+		t.Fatalf("expected 9, got %d", got)
+	}
+}
+
+func TestResolveServerNode(t *testing.T) {
+	if got := resolveServerNode(10, 0); got != 10 {
+		t.Fatalf("expected 10, got %d", got)
+	}
+	if got := resolveServerNode(10, 20); got != 20 {
+		t.Fatalf("expected 20, got %d", got)
 	}
 }

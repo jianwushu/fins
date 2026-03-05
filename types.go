@@ -19,33 +19,31 @@ var (
 
 // FinsClientConfig FINS客户端配置
 type FinsClientConfig struct {
-	IP             string        // PLC IP地址
-	Port           int           // 端口号，默认9600
-	LocalNode      byte          // 本地节点地址
-	ServerNode     byte          // 服务器节点地址
-	Timeout        time.Duration // 超时时间
-	RetryCount     int           // 重试次数
-	SIDMode        SIDMode       // SID模式
-	FixedSID       byte          // 固定模式下的SID值
-	StartSID       byte          // 递增模式的起始值
-	MaxSID         byte          // SID循环最大值
-	EnableAutoNode bool          // 是否自动获取节点地址
+	IP         string        // PLC IP地址
+	Port       int           // 端口号，默认9600
+	LocalNode  byte          // 本地节点地址
+	ServerNode byte          // 服务器节点地址
+	Timeout    time.Duration // 超时时间
+	RetryCount int           // 重试次数
+	SIDMode    SIDMode       // SID模式
+	FixedSID   byte          // 固定模式下的SID值
+	StartSID   byte          // 递增模式的起始值
+	MaxSID     byte          // SID循环最大值
 }
 
 // DefaultConfig 返回默认配置
 func DefaultConfig(ip string) *FinsClientConfig {
 	return &FinsClientConfig{
-		IP:             ip,
-		Port:           DefaultPort,
-		LocalNode:      0x01,
-		ServerNode:     0x00, // 需要动态获取
-		Timeout:        5 * time.Second,
-		RetryCount:     3,
-		SIDMode:        SIDFixed,
-		FixedSID:       0x00,
-		StartSID:       0x00,
-		MaxSID:         0xFF,
-		EnableAutoNode: true,
+		IP:         ip,
+		Port:       DefaultPort,
+		LocalNode:  0x00,
+		ServerNode: 0x00,
+		Timeout:    5 * time.Second,
+		RetryCount: 3,
+		SIDMode:    SIDFixed,
+		FixedSID:   0x00,
+		StartSID:   0x00,
+		MaxSID:     0xFF,
 	}
 }
 
@@ -65,15 +63,25 @@ type FinsUDPFrame struct {
 	Data    []byte // 数据
 }
 
-// FinsTCPFrame FINS TCP帧结构
+// FinsTCPFrame FINS/TCP 外层封装帧结构（官方头）
+//
+// 外层固定 16 字节：
+//   - Magic(4) 固定 "FINS"
+//   - Length(4) 表示后续字节数（Command+ErrorCode+Data），因此最小为 8
+//   - Command(4)
+//   - ErrorCode(4)
+//   - Data(N)
+//
+// 注意：TCP 传输下真正的 FINS 报文放在 Data 中（即“内层”FINS：10B 头 + 2B 命令 + 参数）。
+// 内层 FINS 报文的编解码尽量复用 UDP 的 Build/Parse。
+//
+// 参考：[`BuildTCPFrame()`](tcp_frame.go:10)、[`ReadTCPFrameFromConn()`](tcp_frame.go:135)
 type FinsTCPFrame struct {
-	Magic      [4]byte // 魔数 "FINS"
-	Length     uint32  // 帧长度
-	ErrorCode  uint32  // 错误码
-	ClientNode uint32  // 客户端节点号
-	ServerNode uint32  // 服务器节点号
-	Command    uint16  // 命令码
-	Data       []byte  // 数据
+	Magic     [4]byte // 魔数 "FINS"
+	Length    uint32  // 后续长度（Command+ErrorCode+Data）
+	Command   uint32  // 外层命令
+	ErrorCode uint32  // 外层错误码
+	Data      []byte  // 外层数据（承载内层 FINS 报文）
 }
 
 // FinsResponse FINS响应结构
@@ -121,9 +129,9 @@ type WriteRequest struct {
 
 // PendingRequest 待处理的请求
 type PendingRequest struct {
-	SID       byte              // 服务ID
-	Request   []byte            // 请求数据
-	CreatedAt time.Time         // 创建时间
+	SID       byte               // 服务ID
+	Request   []byte             // 请求数据
+	CreatedAt time.Time          // 创建时间
 	Response  chan *FinsResponse // 响应通道
 }
 
@@ -136,4 +144,3 @@ type ConnectionStats struct {
 	LastRequestAt  time.Time // 最后请求时间
 	LastResponseAt time.Time // 最后响应时间
 }
-

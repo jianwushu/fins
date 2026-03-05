@@ -9,7 +9,7 @@ import (
 
 func main() {
 	// 创建TCP客户端配置
-	config := fins.DefaultConfig("192.168.1.10")
+	config := fins.DefaultConfig("127.0.0.1")
 	config.LocalNode = 0x01
 	config.ServerNode = 0x64
 
