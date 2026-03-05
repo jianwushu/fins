@@ -1,6 +1,7 @@
 package fins
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -21,7 +22,7 @@ type ReconnectPolicy struct {
 func DefaultReconnectPolicy() *ReconnectPolicy {
 	return &ReconnectPolicy{
 		EnableAutoReconnect:  true,
-		MaxReconnectAttempts: 0, // 无限重试
+		MaxReconnectAttempts: 0,
 		InitialDelay:         1 * time.Second,
 		MaxDelay:             30 * time.Second,
 		BackoffFactor:        2.0,
@@ -39,8 +40,8 @@ type ReconnectableClient struct {
 	reconnectCount  int
 	lastReconnectAt time.Time
 	stopHealthCheck chan struct{}
-	onReconnect     func() // 重连成功回调
-	onDisconnect    func() // 断开连接回调
+	onReconnect     func()
+	onDisconnect    func()
 }
 
 // NewReconnectableClient 创建支持自动重连的客户端
@@ -55,7 +56,6 @@ func NewReconnectableClient(client *FinsClient, policy *ReconnectPolicy) *Reconn
 		stopHealthCheck: make(chan struct{}),
 	}
 
-	// 启动健康检查
 	if policy.HealthCheckInterval > 0 {
 		go rc.healthCheckLoop()
 	}
@@ -88,206 +88,14 @@ func (rc *ReconnectableClient) Close() error {
 	return rc.client.Close()
 }
 
-// reconnect 执行重连
-func (rc *ReconnectableClient) reconnect() error {
-	rc.mutex.Lock()
-	if rc.reconnecting {
-		rc.mutex.Unlock()
-		return fmt.Errorf("正在重连中")
-	}
-	rc.reconnecting = true
-	rc.mutex.Unlock()
-
-	defer func() {
-		rc.mutex.Lock()
-		rc.reconnecting = false
-		rc.mutex.Unlock()
-	}()
-
-	// 调用断开连接回调
-	if rc.onDisconnect != nil {
-		rc.onDisconnect()
-	}
-
-	// 关闭旧连接
-	rc.client.Close()
-
-	delay := rc.policy.InitialDelay
-	attempts := 0
-
-	for {
-		attempts++
-		rc.reconnectCount++
-
-		// 检查是否超过最大重试次数
-		if rc.policy.MaxReconnectAttempts > 0 && attempts > rc.policy.MaxReconnectAttempts {
-			return fmt.Errorf("重连失败: 超过最大重试次数 %d", rc.policy.MaxReconnectAttempts)
-		}
-
-		fmt.Printf("[重连] 第 %d 次尝试重连...\n", attempts)
-
-		// 尝试重连
-		err := rc.client.Connect()
-		if err == nil {
-			rc.lastReconnectAt = time.Now()
-			fmt.Printf("[重连] 重连成功!\n")
-
-			// 调用重连成功回调
-			if rc.onReconnect != nil {
-				rc.onReconnect()
-			}
-
-			return nil
-		}
-
-		fmt.Printf("[重连] 重连失败: %v, %v 后重试\n", err, delay)
-
-		// 等待后重试
-		time.Sleep(delay)
-
-		// 计算下次延迟(指数退避)
-		delay = time.Duration(float64(delay) * rc.policy.BackoffFactor)
-		if delay > rc.policy.MaxDelay {
-			delay = rc.policy.MaxDelay
-		}
-	}
+// IsConnected 检查是否已连接
+func (rc *ReconnectableClient) IsConnected() bool {
+	return rc.client.IsConnected()
 }
 
-// healthCheckLoop 健康检查循环
-func (rc *ReconnectableClient) healthCheckLoop() {
-	ticker := time.NewTicker(rc.policy.HealthCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			if !rc.client.IsConnected() {
-				fmt.Println("[健康检查] 检测到连接断开，尝试重连...")
-				if rc.policy.EnableAutoReconnect {
-					go rc.reconnect()
-				}
-			}
-		case <-rc.stopHealthCheck:
-			return
-		}
-	}
-}
-
-// executeWithReconnect 执行操作，失败时自动重连
-func (rc *ReconnectableClient) executeWithReconnect(operation func() error) error {
-	err := operation()
-	if err != nil && rc.policy.ReconnectOnError && rc.policy.EnableAutoReconnect {
-		// 判断是否是连接错误
-		if isConnectionError(err) {
-			fmt.Printf("[自动重连] 检测到连接错误: %v\n", err)
-
-			// 尝试重连
-			if reconnectErr := rc.reconnect(); reconnectErr != nil {
-				return fmt.Errorf("重连失败: %w, 原始错误: %v", reconnectErr, err)
-			}
-
-			// 重连成功后重试操作
-			return operation()
-		}
-	}
-	return err
-}
-
-// isConnectionError 判断是否是连接错误
-func isConnectionError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// 检查常见的连接错误
-	errStr := err.Error()
-	connectionErrors := []string{
-		"connection refused",
-		"connection reset",
-		"broken pipe",
-		"EOF",
-		"连接已关闭",
-		"发送失败",
-		"读取失败",
-	}
-
-	for _, connErr := range connectionErrors {
-		if contains(errStr, connErr) {
-			return true
-		}
-	}
-
-	return err == ErrConnectionClosed || err == ErrTimeout
-}
-
-// contains 检查字符串是否包含子串
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-			findSubstring(s, substr)))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// ReadMemoryArea 读取内存区域(带自动重连)
-func (rc *ReconnectableClient) ReadMemoryArea(areaCode byte, address uint16, count uint16) ([]byte, error) {
-	var result []byte
-	err := rc.executeWithReconnect(func() error {
-		data, err := rc.client.ReadMemoryArea(areaCode, address, count)
-		result = data
-		return err
-	})
-	return result, err
-}
-
-// WriteMemoryArea 写入内存区域(带自动重连)
-func (rc *ReconnectableClient) WriteMemoryArea(areaCode byte, address uint16, values []uint16) error {
-	return rc.executeWithReconnect(func() error {
-		return rc.client.WriteMemoryArea(areaCode, address, values)
-	})
-}
-
-// ReadDWord 读取D区单个字(带自动重连)
-func (rc *ReconnectableClient) ReadDWord(address uint16) (uint16, error) {
-	var result uint16
-	err := rc.executeWithReconnect(func() error {
-		value, err := rc.client.ReadDWord(address)
-		result = value
-		return err
-	})
-	return result, err
-}
-
-// WriteDWord 写入D区单个字(带自动重连)
-func (rc *ReconnectableClient) WriteDWord(address uint16, value uint16) error {
-	return rc.executeWithReconnect(func() error {
-		return rc.client.WriteDWord(address, value)
-	})
-}
-
-// ReadDBytes 读取D区字节数组(带自动重连)
-func (rc *ReconnectableClient) ReadDBytes(address uint16, byteCount uint16) ([]byte, error) {
-	var result []byte
-	err := rc.executeWithReconnect(func() error {
-		data, err := rc.client.ReadDBytes(address, byteCount)
-		result = data
-		return err
-	})
-	return result, err
-}
-
-// WriteDBytes 写入D区字节数组(带自动重连)
-func (rc *ReconnectableClient) WriteDBytes(address uint16, data []byte) error {
-	return rc.executeWithReconnect(func() error {
-		return rc.client.WriteDBytes(address, data)
-	})
+// GetStats 获取统计信息
+func (rc *ReconnectableClient) GetStats() ConnectionStats {
+	return rc.client.GetStats()
 }
 
 // GetReconnectCount 获取重连次数
@@ -311,12 +119,264 @@ func (rc *ReconnectableClient) IsReconnecting() bool {
 	return rc.reconnecting
 }
 
-// GetStats 获取统计信息
-func (rc *ReconnectableClient) GetStats() ConnectionStats {
-	return rc.client.GetStats()
+// ========== 对外统一 API（字符串地址，带自动重连） ==========
+
+func (rc *ReconnectableClient) ReadWord(address string) (uint16, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return 0, err
+	}
+	if pa.IsBit {
+		return 0, fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+
+	var data []byte
+	err = rc.executeWithReconnect(func() error {
+		v, execErr := rc.client.readMemoryArea(pa.AreaCode, pa.Address, 1)
+		data = v
+		return execErr
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(data) < 2 {
+		return 0, ErrInvalidResponse
+	}
+	return binary.BigEndian.Uint16(data[0:2]), nil
 }
 
-// IsConnected 检查是否已连接
-func (rc *ReconnectableClient) IsConnected() bool {
-	return rc.client.IsConnected()
+func (rc *ReconnectableClient) ReadWords(address string, count uint16) ([]uint16, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return nil, err
+	}
+	if pa.IsBit {
+		return nil, fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+
+	var data []byte
+	err = rc.executeWithReconnect(func() error {
+		v, execErr := rc.client.readMemoryArea(pa.AreaCode, pa.Address, count)
+		data = v
+		return execErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < int(count)*2 {
+		return nil, ErrInvalidResponse
+	}
+
+	result := make([]uint16, count)
+	for i := uint16(0); i < count; i++ {
+		result[i] = binary.BigEndian.Uint16(data[i*2 : (i+1)*2])
+	}
+	return result, nil
+}
+
+func (rc *ReconnectableClient) WriteWord(address string, value uint16) error {
+	return rc.WriteWords(address, []uint16{value})
+}
+
+func (rc *ReconnectableClient) WriteWords(address string, values []uint16) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if pa.IsBit {
+		return fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+	return rc.executeWithReconnect(func() error {
+		return rc.client.writeMemoryArea(pa.AreaCode, pa.Address, values)
+	})
+}
+
+func (rc *ReconnectableClient) ReadBytes(address string, byteCount uint16) ([]byte, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return nil, err
+	}
+	if pa.IsBit {
+		return nil, fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+
+	var result []byte
+	err = rc.executeWithReconnect(func() error {
+		v, execErr := rc.client.readBytes(pa.AreaCode, pa.Address, byteCount)
+		result = v
+		return execErr
+	})
+	return result, err
+}
+
+func (rc *ReconnectableClient) WriteBytes(address string, data []byte) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if pa.IsBit {
+		return fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+	return rc.executeWithReconnect(func() error {
+		return rc.client.writeBytes(pa.AreaCode, pa.Address, data)
+	})
+}
+
+func (rc *ReconnectableClient) ReadBit(address string) (bool, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return false, err
+	}
+	if !pa.IsBit {
+		return false, fmt.Errorf("%w: %q is not bit address", ErrInvalidAddress, address)
+	}
+
+	var result bool
+	err = rc.executeWithReconnect(func() error {
+		v, execErr := rc.client.readBit(pa.AreaCode, pa.Address, pa.BitNo)
+		result = v
+		return execErr
+	})
+	return result, err
+}
+
+func (rc *ReconnectableClient) WriteBit(address string, value bool) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if !pa.IsBit {
+		return fmt.Errorf("%w: %q is not bit address", ErrInvalidAddress, address)
+	}
+	return rc.executeWithReconnect(func() error {
+		return rc.client.writeBit(pa.AreaCode, pa.Address, pa.BitNo, value)
+	})
+}
+
+// ========== 自动重连内部实现 ==========
+
+func (rc *ReconnectableClient) reconnect() error {
+	rc.mutex.Lock()
+	if rc.reconnecting {
+		rc.mutex.Unlock()
+		return fmt.Errorf("正在重连中")
+	}
+	rc.reconnecting = true
+	rc.mutex.Unlock()
+
+	defer func() {
+		rc.mutex.Lock()
+		rc.reconnecting = false
+		rc.mutex.Unlock()
+	}()
+
+	if rc.onDisconnect != nil {
+		rc.onDisconnect()
+	}
+
+	_ = rc.client.Close()
+
+	delay := rc.policy.InitialDelay
+	attempts := 0
+
+	for {
+		attempts++
+		rc.reconnectCount++
+
+		if rc.policy.MaxReconnectAttempts > 0 && attempts > rc.policy.MaxReconnectAttempts {
+			return fmt.Errorf("重连失败: 超过最大重试次数 %d", rc.policy.MaxReconnectAttempts)
+		}
+
+		fmt.Printf("[重连] 第 %d 次尝试重连...\n", attempts)
+
+		err := rc.client.Connect()
+		if err == nil {
+			rc.lastReconnectAt = time.Now()
+			fmt.Printf("[重连] 重连成功!\n")
+			if rc.onReconnect != nil {
+				rc.onReconnect()
+			}
+			return nil
+		}
+
+		fmt.Printf("[重连] 重连失败: %v, %v 后重试\n", err, delay)
+		time.Sleep(delay)
+		delay = time.Duration(float64(delay) * rc.policy.BackoffFactor)
+		if delay > rc.policy.MaxDelay {
+			delay = rc.policy.MaxDelay
+		}
+	}
+}
+
+func (rc *ReconnectableClient) healthCheckLoop() {
+	ticker := time.NewTicker(rc.policy.HealthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if !rc.client.IsConnected() {
+				fmt.Println("[健康检查] 检测到连接断开，尝试重连...")
+				if rc.policy.EnableAutoReconnect {
+					go func() { _ = rc.reconnect() }()
+				}
+			}
+		case <-rc.stopHealthCheck:
+			return
+		}
+	}
+}
+
+func (rc *ReconnectableClient) executeWithReconnect(operation func() error) error {
+	err := operation()
+	if err != nil && rc.policy.ReconnectOnError && rc.policy.EnableAutoReconnect {
+		if isConnectionError(err) {
+			fmt.Printf("[自动重连] 检测到连接错误: %v\n", err)
+			if reconnectErr := rc.reconnect(); reconnectErr != nil {
+				return fmt.Errorf("重连失败: %w, 原始错误: %v", reconnectErr, err)
+			}
+			return operation()
+		}
+	}
+	return err
+}
+
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+	connectionErrors := []string{
+		"connection refused",
+		"connection reset",
+		"broken pipe",
+		"EOF",
+		"连接已关闭",
+		"发送失败",
+		"读取失败",
+	}
+
+	for _, connErr := range connectionErrors {
+		if contains(errStr, connErr) {
+			return true
+		}
+	}
+
+	return err == ErrConnectionClosed || err == ErrTimeout
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
+		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
+			findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

@@ -2,6 +2,7 @@ package fins
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // Client FINS客户端接口
@@ -50,8 +51,154 @@ func (c *FinsClient) Close() error {
 	return c.client.Close()
 }
 
-// ReadMemoryArea 读取内存区域
-func (c *FinsClient) ReadMemoryArea(areaCode byte, address uint16, count uint16) ([]byte, error) {
+// IsConnected 检查是否已连接
+func (c *FinsClient) IsConnected() bool {
+	return c.client.IsConnected()
+}
+
+// GetStats 获取统计信息
+func (c *FinsClient) GetStats() ConnectionStats {
+	return c.client.GetStats()
+}
+
+// GetConfig 获取配置
+func (c *FinsClient) GetConfig() *FinsClientConfig {
+	return c.config
+}
+
+// ========== 对外统一 API（字符串地址） ==========
+
+// ReadWord 按字符串地址读取 1 个 word（16bit）。
+//
+// 示例："D100"、"WR200"。
+func (c *FinsClient) ReadWord(address string) (uint16, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return 0, err
+	}
+	if pa.IsBit {
+		return 0, fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+
+	data, err := c.readMemoryArea(pa.AreaCode, pa.Address, 1)
+	if err != nil {
+		return 0, err
+	}
+	if len(data) < 2 {
+		return 0, ErrInvalidResponse
+	}
+	return binary.BigEndian.Uint16(data[0:2]), nil
+}
+
+// ReadWords 按字符串地址批量读取 word。
+//
+// address 为起始 word 地址，例如 "D100"；count 为 word 数量。
+func (c *FinsClient) ReadWords(address string, count uint16) ([]uint16, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return nil, err
+	}
+	if pa.IsBit {
+		return nil, fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+
+	data, err := c.readMemoryArea(pa.AreaCode, pa.Address, count)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) < int(count)*2 {
+		return nil, ErrInvalidResponse
+	}
+
+	result := make([]uint16, count)
+	for i := uint16(0); i < count; i++ {
+		result[i] = binary.BigEndian.Uint16(data[i*2 : (i+1)*2])
+	}
+	return result, nil
+}
+
+// WriteWord 按字符串地址写入 1 个 word（16bit）。
+func (c *FinsClient) WriteWord(address string, value uint16) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if pa.IsBit {
+		return fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+	return c.writeMemoryArea(pa.AreaCode, pa.Address, []uint16{value})
+}
+
+// WriteWords 按字符串地址批量写入 word。
+// address 为起始 word 地址，例如 "D200"；values 为 word 列表。
+func (c *FinsClient) WriteWords(address string, values []uint16) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if pa.IsBit {
+		return fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+	return c.writeMemoryArea(pa.AreaCode, pa.Address, values)
+}
+
+// ReadBytes 按字符串地址读取字节数组。
+//
+// address 为起始 word 地址（例如 "D100"），byteCount 为要读取的字节数。
+func (c *FinsClient) ReadBytes(address string, byteCount uint16) ([]byte, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return nil, err
+	}
+	if pa.IsBit {
+		return nil, fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+	return c.readBytes(pa.AreaCode, pa.Address, byteCount)
+}
+
+// WriteBytes 按字符串地址写入字节数组。
+//
+// address 为起始 word 地址（例如 "D200"）。
+func (c *FinsClient) WriteBytes(address string, data []byte) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if pa.IsBit {
+		return fmt.Errorf("%w: %q is bit address", ErrInvalidAddress, address)
+	}
+	return c.writeBytes(pa.AreaCode, pa.Address, data)
+}
+
+// ReadBit 按字符串 bit 地址读取 1 个 bit。
+//
+// 示例："CIO0.00"、"WR10.15"。
+func (c *FinsClient) ReadBit(address string) (bool, error) {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return false, err
+	}
+	if !pa.IsBit {
+		return false, fmt.Errorf("%w: %q is not bit address", ErrInvalidAddress, address)
+	}
+	return c.readBit(pa.AreaCode, pa.Address, pa.BitNo)
+}
+
+// WriteBit 按字符串 bit 地址写入 1 个 bit。
+func (c *FinsClient) WriteBit(address string, value bool) error {
+	pa, err := ParseAddress(address)
+	if err != nil {
+		return err
+	}
+	if !pa.IsBit {
+		return fmt.Errorf("%w: %q is not bit address", ErrInvalidAddress, address)
+	}
+	return c.writeBit(pa.AreaCode, pa.Address, pa.BitNo, value)
+}
+
+// ========== 内部底座（areaCode/address）- 不对外暴露 ==========
+
+func (c *FinsClient) readMemoryArea(areaCode byte, address uint16, count uint16) ([]byte, error) {
 	req := &ReadRequest{
 		AreaCode: areaCode,
 		Address:  address,
@@ -69,9 +216,7 @@ func (c *FinsClient) ReadMemoryArea(areaCode byte, address uint16, count uint16)
 	return ParseReadMemoryResponse(resp)
 }
 
-// WriteMemoryArea 写入内存区域
-func (c *FinsClient) WriteMemoryArea(areaCode byte, address uint16, values []uint16) error {
-	// 构建写入数据
+func (c *FinsClient) writeMemoryArea(areaCode byte, address uint16, values []uint16) error {
 	data := make([]byte, len(values)*2)
 	for i, v := range values {
 		binary.BigEndian.PutUint16(data[i*2:], v)
@@ -95,8 +240,7 @@ func (c *FinsClient) WriteMemoryArea(areaCode byte, address uint16, values []uin
 	return ParseWriteMemoryResponse(resp)
 }
 
-// ReadBit 读取单个位
-func (c *FinsClient) ReadBit(areaCode byte, address uint16, bitNo byte) (bool, error) {
+func (c *FinsClient) readBit(areaCode byte, address uint16, bitNo byte) (bool, error) {
 	req := &ReadRequest{
 		AreaCode: areaCode,
 		Address:  address,
@@ -123,8 +267,7 @@ func (c *FinsClient) ReadBit(areaCode byte, address uint16, bitNo byte) (bool, e
 	return result[0] != 0, nil
 }
 
-// WriteBit 写入单个位
-func (c *FinsClient) WriteBit(areaCode byte, address uint16, bitNo byte, value bool) error {
+func (c *FinsClient) writeBit(areaCode byte, address uint16, bitNo byte, value bool) error {
 	var bitValue byte
 	if value {
 		bitValue = 1
@@ -148,83 +291,7 @@ func (c *FinsClient) WriteBit(areaCode byte, address uint16, bitNo byte, value b
 	return ParseWriteMemoryResponse(resp)
 }
 
-// ReadDWord 读取D区单个字
-func (c *FinsClient) ReadDWord(address uint16) (uint16, error) {
-	data, err := c.ReadMemoryArea(MemAreaD, address, 1)
-	if err != nil {
-		return 0, err
-	}
-	if len(data) < 2 {
-		return 0, ErrInvalidResponse
-	}
-	return binary.BigEndian.Uint16(data[0:2]), nil
-}
-
-// ReadDWords 读取D区多个字
-func (c *FinsClient) ReadDWords(address uint16, count uint16) ([]uint16, error) {
-	data, err := c.ReadMemoryArea(MemAreaD, address, count)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(data) < int(count)*2 {
-		return nil, ErrInvalidResponse
-	}
-
-	result := make([]uint16, count)
-	for i := uint16(0); i < count; i++ {
-		result[i] = binary.BigEndian.Uint16(data[i*2 : (i+1)*2])
-	}
-	return result, nil
-}
-
-// WriteDWord 写入D区单个字
-func (c *FinsClient) WriteDWord(address uint16, value uint16) error {
-	return c.WriteMemoryArea(MemAreaD, address, []uint16{value})
-}
-
-// WriteDWords 写入D区多个字
-func (c *FinsClient) WriteDWords(address uint16, values []uint16) error {
-	return c.WriteMemoryArea(MemAreaD, address, values)
-}
-
-// ReadCIOBit 读取CIO区位
-func (c *FinsClient) ReadCIOBit(address uint16, bitNo byte) (bool, error) {
-	return c.ReadBit(MemAreaCIO, address, bitNo)
-}
-
-// WriteCIOBit 写入CIO区位
-func (c *FinsClient) WriteCIOBit(address uint16, bitNo byte, value bool) error {
-	return c.WriteBit(MemAreaCIO, address, bitNo, value)
-}
-
-// IsConnected 检查是否已连接
-func (c *FinsClient) IsConnected() bool {
-	return c.client.IsConnected()
-}
-
-// GetStats 获取统计信息
-func (c *FinsClient) GetStats() ConnectionStats {
-	return c.client.GetStats()
-}
-
-// GetConfig 获取配置
-func (c *FinsClient) GetConfig() *FinsClientConfig {
-	return c.config
-}
-
-// SendRawRequest 发送原始请求
-func (c *FinsClient) SendRawRequest(command uint16, data []byte) (*FinsResponse, error) {
-	return c.client.SendRequest(command, data)
-}
-
-// ReadBytes 读取内存区域为字节数组
-// areaCode: 内存区域代码
-// address: 起始地址
-// byteCount: 要读取的字节数
-// 返回: 字节数组
-func (c *FinsClient) ReadBytes(areaCode byte, address uint16, byteCount uint16) ([]byte, error) {
-	// 计算需要读取的字数(每个字2字节)
+func (c *FinsClient) readBytes(areaCode byte, address uint16, byteCount uint16) ([]byte, error) {
 	wordCount := (byteCount + 1) / 2 // 向上取整
 
 	req := &ReadRequest{
@@ -246,28 +313,20 @@ func (c *FinsClient) ReadBytes(areaCode byte, address uint16, byteCount uint16) 
 		return nil, err
 	}
 
-	// 如果请求的字节数是奇数,只返回需要的字节数
 	if uint16(len(result)) > byteCount {
 		return result[:byteCount], nil
 	}
-
 	return result, nil
 }
 
-// WriteBytes 写入字节数组到内存区域
-// areaCode: 内存区域代码
-// address: 起始地址
-// data: 要写入的字节数组
-func (c *FinsClient) WriteBytes(areaCode byte, address uint16, data []byte) error {
-	// 如果字节数是奇数,需要补齐到偶数
+func (c *FinsClient) writeBytes(areaCode byte, address uint16, data []byte) error {
 	writeData := data
 	if len(data)%2 != 0 {
 		writeData = make([]byte, len(data)+1)
 		copy(writeData, data)
-		writeData[len(data)] = 0 // 补0
+		writeData[len(data)] = 0
 	}
 
-	// 计算字数
 	wordCount := uint16(len(writeData) / 2)
 
 	req := &WriteRequest{
@@ -286,44 +345,4 @@ func (c *FinsClient) WriteBytes(areaCode byte, address uint16, data []byte) erro
 	}
 
 	return ParseWriteMemoryResponse(resp)
-}
-
-// ReadDBytes 读取D区字节数组
-func (c *FinsClient) ReadDBytes(address uint16, byteCount uint16) ([]byte, error) {
-	return c.ReadBytes(MemAreaD, address, byteCount)
-}
-
-// WriteDBytes 写入D区字节数组
-func (c *FinsClient) WriteDBytes(address uint16, data []byte) error {
-	return c.WriteBytes(MemAreaD, address, data)
-}
-
-// ReadCIOBytes 读取CIO区字节数组
-func (c *FinsClient) ReadCIOBytes(address uint16, byteCount uint16) ([]byte, error) {
-	return c.ReadBytes(MemAreaCIO, address, byteCount)
-}
-
-// WriteCIOBytes 写入CIO区字节数组
-func (c *FinsClient) WriteCIOBytes(address uint16, data []byte) error {
-	return c.WriteBytes(MemAreaCIO, address, data)
-}
-
-// ReadHRBytes 读取HR区字节数组
-func (c *FinsClient) ReadHRBytes(address uint16, byteCount uint16) ([]byte, error) {
-	return c.ReadBytes(MemAreaHR, address, byteCount)
-}
-
-// WriteHRBytes 写入HR区字节数组
-func (c *FinsClient) WriteHRBytes(address uint16, data []byte) error {
-	return c.WriteBytes(MemAreaHR, address, data)
-}
-
-// ReadWRBytes 读取WR区字节数组
-func (c *FinsClient) ReadWRBytes(address uint16, byteCount uint16) ([]byte, error) {
-	return c.ReadBytes(MemAreaWR, address, byteCount)
-}
-
-// WriteWRBytes 写入WR区字节数组
-func (c *FinsClient) WriteWRBytes(address uint16, data []byte) error {
-	return c.WriteBytes(MemAreaWR, address, data)
 }

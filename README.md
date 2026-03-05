@@ -6,7 +6,7 @@
 
 - ✅ 支持FINS TCP协议
 - ✅ 支持FINS UDP协议
-- ✅ 完整的内存区域读写操作
+- ✅ 完整的内存区域读写操作（**统一字符串地址 API：如 `D100`、`CIO0.00`**）
 - ✅ 支持位操作和字操作
 - ✅ 字节数组操作支持
 - ✅ 灵活的SID模式（固定/递增）
@@ -41,28 +41,28 @@ func main() {
     config := fins.DefaultConfig("192.168.1.10")
     config.LocalNode = 0x01
     config.ServerNode = 0x64
-    
+
     // 创建UDP客户端
     client, err := fins.NewClient(config, false)
     if err != nil {
         log.Fatal(err)
     }
     defer client.Close()
-    
+
     // 连接
     if err := client.Connect(); err != nil {
         log.Fatal(err)
     }
-    
-    // 读取D100寄存器
-    value, err := client.ReadDWord(100)
+
+    // 读取 D100
+    value, err := client.ReadWord("D100")
     if err != nil {
         log.Fatal(err)
     }
     fmt.Printf("D100 = %d\n", value)
-    
-    // 写入D100寄存器
-    if err := client.WriteDWord(100, 1234); err != nil {
+
+    // 写入 D100
+    if err := client.WriteWord("D100", 1234); err != nil {
         log.Fatal(err)
     }
 }
@@ -80,69 +80,39 @@ client, err := fins.NewClient(config, true)
 ### 读取操作
 
 ```go
-// 读取单个D区寄存器
-value, err := client.ReadDWord(100)
+// 读取单个 word
+value, err := client.ReadWord("D100")
 
-// 批量读取D区寄存器
-values, err := client.ReadDWords(100, 10)
+// 批量读取 word（起始地址 + 数量）
+values, err := client.ReadWords("D100", 10)
 
-// 读取CIO区位
-bit, err := client.ReadCIOBit(0, 0)
+// 读取 bit
+bit, err := client.ReadBit("CIO0.00")
 
-// 读取通用内存区域
-data, err := client.ReadMemoryArea(fins.MemAreaD, 100, 5)
+// 读取字节数组（按字对齐，内部自动处理奇数字节）
+data, err := client.ReadBytes("D100", 10)
 ```
 
 ### 写入操作
 
 ```go
-// 写入单个D区寄存器
-err := client.WriteDWord(100, 1234)
+// 写入单个 word
+err := client.WriteWord("D100", 1234)
 
-// 批量写入D区寄存器
+// 批量写入 word
 values := []uint16{100, 200, 300}
-err := client.WriteDWords(100, values)
+err := client.WriteWords("D200", values)
 
-// 写入CIO区位
-err := client.WriteCIOBit(0, 0, true)
-
-// 写入通用内存区域
-err := client.WriteMemoryArea(fins.MemAreaD, 100, values)
-```
-
-### 字节数组操作
-
-```go
-// 读取字节数组
-data, err := client.ReadDBytes(100, 10)  // 读取D100开始的10个字节
-fmt.Printf("读取数据: % X\n", data)
+// 写入 bit
+err := client.WriteBit("CIO0.00", true)
 
 // 写入字节数组
-writeData := []byte{0x01, 0x02, 0x03, 0x04, 0x05}
-err := client.WriteDBytes(200, writeData)
-
-// 不同内存区域的字节操作
-cioData, err := client.ReadCIOBytes(0, 8)   // 读取CIO区
-err = client.WriteHRBytes(0, []byte{0xAA, 0xBB})  // 写入HR区
-err = client.WriteWRBytes(0, []byte{0x11, 0x22})  // 写入WR区
-
-// 字节数组与整数转换
-value := uint32(0x12345678)
-buf := make([]byte, 4)
-binary.BigEndian.PutUint32(buf, value)
-err = client.WriteDBytes(300, buf)
-
-// 字符串操作
-text := "FINS Protocol"
-err = client.WriteDBytes(400, []byte(text))
-readData, _ := client.ReadDBytes(400, uint16(len(text)))
-readText := string(readData)
+err := client.WriteBytes("D200", []byte{0x01, 0x02, 0x03})
 ```
 
 ### 重试机制
 
 ```go
-// 创建自定义重试策略
 retryPolicy := &fins.RetryPolicy{
     MaxRetries:    5,
     InitialDelay:  200 * time.Millisecond,
@@ -150,78 +120,45 @@ retryPolicy := &fins.RetryPolicy{
     BackoffFactor: 2.0,
 }
 
-// 创建支持重试的客户端
 retryClient := fins.NewRetryableClient(client, retryPolicy)
-
-// 使用重试客户端
-data, err := retryClient.ReadMemoryArea(fins.MemAreaD, 100, 1)
+value, err := retryClient.ReadWord("D100")
 ```
 
 ### 自动重连机制 (新增)
 
 ```go
-// 创建TCP客户端
 client, _ := fins.NewClient(config, true)
 
-// 创建重连策略
 reconnectPolicy := &fins.ReconnectPolicy{
-    EnableAutoReconnect:  true,              // 启用自动重连
-    MaxReconnectAttempts: 0,                 // 0 = 无限重试
-    InitialDelay:         1 * time.Second,   // 初始延迟
-    MaxDelay:             30 * time.Second,  // 最大延迟
-    BackoffFactor:        2.0,               // 退避因子
-    ReconnectOnError:     true,              // 读写错误时重连
-    HealthCheckInterval:  10 * time.Second,  // 健康检查间隔
+    EnableAutoReconnect:  true,
+    MaxReconnectAttempts: 0,
+    InitialDelay:         1 * time.Second,
+    MaxDelay:             30 * time.Second,
+    BackoffFactor:        2.0,
+    ReconnectOnError:     true,
+    HealthCheckInterval:  10 * time.Second,
 }
 
-// 创建支持自动重连的客户端
 reconnectClient := fins.NewReconnectableClient(client, reconnectPolicy)
-
-// 设置回调
 reconnectClient.SetOnReconnect(func() {
     fmt.Println("✅ 重连成功!")
 })
-
 reconnectClient.SetOnDisconnect(func() {
     fmt.Println("❌ 连接断开!")
 })
 
-// 连接
 reconnectClient.Connect()
-
-// 正常使用,连接断开时会自动重连
-value, _ := reconnectClient.ReadDWord(100)
-
-// 查看重连统计
-count := reconnectClient.GetReconnectCount()
-fmt.Printf("重连次数: %d\n", count)
+value, _ := reconnectClient.ReadWord("D100")
 ```
 
-## 内存区域代码
+## 地址格式
 
-| 代码 | 常量 | 说明 |
-|-----|------|------|
-| 0x30 | MemAreaCIO | CIO区 - 输入输出继电器 |
-| 0x31 | MemAreaWR | WR区 - 工作继电器 |
-| 0x32 | MemAreaHR | HR区 - 保持继电器 |
-| 0x82 | MemAreaD | D区 - 数据寄存器 |
-| 0x89 | MemAreaT | T区 - 定时器当前值 |
-| 0x8C | MemAreaC | C区 - 计数器当前值 |
+- Word 地址：`D100`、`CIO0`、`WR200`、`HR300`、`A0`、`T0`、`C0`
+- Bit 地址：`CIO0.00`、`WR10.15`、`HR200.01`、`A5.0`
 
-## 配置选项
-
-```go
-config := &fins.FinsClientConfig{
-    IP:             "192.168.1.10",
-    Port:           9600,
-    LocalNode:      0x01,
-    ServerNode:     0x64,
-    Timeout:        5 * time.Second,
-    RetryCount:     3,
-    SIDMode:        fins.SIDFixed,
-    FixedSID:       0x00,
-}
-```
+约束：
+- bit 仅支持 `CIO/WR/HR/A`
+- bit 位号范围 `0~15`
 
 ## 示例
 
@@ -236,13 +173,3 @@ config := &fins.FinsClientConfig{
 ## 文档
 
 - [快速入门](QUICKSTART.md) - 快速上手指南
-- [API参考](API_REFERENCE.md) - 完整API文档
-- [自动重连指南](docs/RECONNECT_GUIDE.md) - 重连机制详细说明 (新增)
-- [协议规范](docs/FINS_PROTOCOL_SPEC.md) - FINS协议详细规范
-- [项目结构](PROJECT_STRUCTURE.md) - 项目文件组织说明
-- [更新日志](CHANGELOG.md) - 功能更新记录
-
-## 许可证
-
-MIT License
-

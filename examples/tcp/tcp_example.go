@@ -8,37 +8,32 @@ import (
 )
 
 func main() {
-	// 创建TCP客户端配置
 	config := fins.DefaultConfig("127.0.0.1")
 	config.LocalNode = 0x01
 	config.ServerNode = 0x64
 
-	// 创建TCP客户端
-	client, err := fins.NewClient(config, true) // true表示使用TCP
+	client, err := fins.NewClient(config, true)
 	if err != nil {
 		log.Fatalf("创建客户端失败: %v", err)
 	}
 	defer client.Close()
 
-	// 连接到PLC
 	if err := client.Connect(); err != nil {
 		log.Fatalf("连接失败: %v", err)
 	}
 
 	fmt.Println("成功通过TCP连接到PLC")
 
-	// 示例1: 读取D100寄存器
-	fmt.Println("\n=== 示例1: 读取D100寄存器 ===")
-	value, err := client.ReadDWord(100)
+	fmt.Println("\n=== 示例1: 读取 D100 ===")
+	value, err := client.ReadWord("D100")
 	if err != nil {
-		log.Printf("读取D100失败: %v", err)
+		log.Printf("读取失败: %v", err)
 	} else {
 		fmt.Printf("D100 = %d (0x%04X)\n", value, value)
 	}
 
-	// 示例2: 批量读取
-	fmt.Println("\n=== 示例2: 批量读取D100-D109 ===")
-	values, err := client.ReadDWords(100, 10)
+	fmt.Println("\n=== 示例2: 批量读取 D100-D109 ===")
+	values, err := client.ReadWords("D100", 10)
 	if err != nil {
 		log.Printf("批量读取失败: %v", err)
 	} else {
@@ -47,20 +42,16 @@ func main() {
 		}
 	}
 
-	// 示例3: 写入数据
-	fmt.Println("\n=== 示例3: 写入D100 ===")
-	if err := client.WriteDWord(100, 9999); err != nil {
+	fmt.Println("\n=== 示例3: 写入 D100 ===")
+	if err := client.WriteWord("D100", 9999); err != nil {
 		log.Printf("写入失败: %v", err)
 	} else {
-		fmt.Println("成功写入D100 = 9999")
-
-		// 验证写入
-		if value, err := client.ReadDWord(100); err == nil {
+		fmt.Println("成功写入 D100 = 9999")
+		if value, err := client.ReadWord("D100"); err == nil {
 			fmt.Printf("验证: D100 = %d\n", value)
 		}
 	}
 
-	// 显示统计信息
 	fmt.Println("\n=== 连接统计信息 ===")
 	stats := client.GetStats()
 	fmt.Printf("总请求数: %d\n", stats.TotalRequests)
