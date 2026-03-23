@@ -12,6 +12,7 @@ func main() {
 	config := fins.DefaultConfig("127.0.0.1")
 	config.LocalNode = 0x01
 	config.ServerNode = 0x64
+	// config.Timeout = 0 * time.Millisecond
 
 	client, err := fins.NewClient(config, false)
 	if err != nil {
@@ -24,25 +25,39 @@ func main() {
 	}
 
 	retryPolicy := &fins.RetryPolicy{
-		MaxRetries:    3,
+		MaxRetries:    5,
 		InitialDelay:  200 * time.Millisecond,
-		MaxDelay:      3 * time.Second,
+		MaxDelay:      1 * time.Second,
 		BackoffFactor: 2.0,
+		RetryableErrors: []error{
+			fins.ErrTimeout,
+			fins.ErrConnectionClosed,
+		},
 	}
 
-	retryClient := fins.NewRetryableClient(client, retryPolicy)
-
-	fmt.Println("\n=== 示例1: 带重试的读取 D100 ===")
-	value, err := retryClient.ReadWord("D100")
+	fmt.Println("\n=== 示例1: 对 ReadWord(D100) 做函数级重试 ===")
+	var value uint16
+	err = fins.DoWithRetry(retryPolicy, func() error {
+		var readErr error
+		value, readErr = client.ReadWord("D100")
+		fmt.Printf("%v,%v\n", time.Now().Format("2006-01-02 15:04:05.000"), readErr)
+		return readErr
+	})
 	if err != nil {
 		log.Printf("读取失败: %v", err)
 	} else {
 		fmt.Printf("D100 = %d\n", value)
 	}
 
-	fmt.Println("\n=== 示例2: 带重试的批量写入 D200-D204 ===")
+	fmt.Println("\n=== 示例2: 对 WriteWords(D200) 做函数级重试 ===")
 	values := []uint16{111, 222, 333, 444, 555}
-	if err := retryClient.WriteWords("D200", values); err != nil {
+	err = fins.DoWithRetry(retryPolicy, func() error {
+		writeErr := client.WriteWords("D200", values)
+		fmt.Printf("%v,%v\n", time.Now().Format("2006-01-02 15:04:05.000"), writeErr)
+		return writeErr
+
+	})
+	if err != nil {
 		log.Printf("写入失败: %v", err)
 	} else {
 		fmt.Println("写入成功")

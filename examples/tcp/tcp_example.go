@@ -52,12 +52,5 @@ func main() {
 		}
 	}
 
-	fmt.Println("\n=== 连接统计信息 ===")
-	stats := client.GetStats()
-	fmt.Printf("总请求数: %d\n", stats.TotalRequests)
-	fmt.Printf("成功次数: %d\n", stats.SuccessCount)
-	fmt.Printf("错误次数: %d\n", stats.ErrorCount)
-	fmt.Printf("超时次数: %d\n", stats.TimeoutCount)
-
 	fmt.Println("\nTCP示例执行完成")
 }

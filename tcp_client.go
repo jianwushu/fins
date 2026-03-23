@@ -1,12 +1,70 @@
 package fins
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
+
+// TCPReconnectPolicy TCP 专属轻量重连策略。
+//
+// 第一版仅用于请求路径的连接类错误恢复：
+//   - 不做后台健康检查
+//   - 不做统一包装器
+//   - 不引入新的读写 API
+//   - 仅在请求发送/等待响应过程中遇到连接类错误时，尝试内部重连一次
+//
+// MaxReconnectAttempts 表示单次重连流程内的最大建连尝试次数：
+//   - 0 表示无限尝试
+//   - 1 表示只尝试一次重新 Connect
+//   - 大于 1 表示按退避策略多次尝试
+//
+// ReconnectOnRequestError 控制 [`SendRequest()`](tcp_client.go:234) 是否在连接类错误时触发内部重连。
+type TCPReconnectPolicy struct {
+	EnableAutoReconnect     bool
+	MaxReconnectAttempts    int
+	InitialDelay            time.Duration
+	MaxDelay                time.Duration
+	BackoffFactor           float64
+	ReconnectOnRequestError bool
+}
+
+// DefaultTCPReconnectPolicy 返回默认 TCP 重连策略。
+func DefaultTCPReconnectPolicy() *TCPReconnectPolicy {
+	return &TCPReconnectPolicy{
+		EnableAutoReconnect:     false,
+		MaxReconnectAttempts:    1,
+		InitialDelay:            200 * time.Millisecond,
+		MaxDelay:                3 * time.Second,
+		BackoffFactor:           2.0,
+		ReconnectOnRequestError: true,
+	}
+}
+
+func cloneTCPReconnectPolicy(policy *TCPReconnectPolicy) *TCPReconnectPolicy {
+	if policy == nil {
+		policy = DefaultTCPReconnectPolicy()
+	}
+
+	cloned := *policy
+	if cloned.InitialDelay <= 0 {
+		cloned.InitialDelay = 200 * time.Millisecond
+	}
+	if cloned.MaxDelay <= 0 {
+		cloned.MaxDelay = 3 * time.Second
+	}
+	if cloned.BackoffFactor < 1 {
+		cloned.BackoffFactor = 2.0
+	}
+	if cloned.MaxDelay < cloned.InitialDelay {
+		cloned.MaxDelay = cloned.InitialDelay
+	}
+	return &cloned
+}
 
 // FinsTCPClient FINS TCP客户端
 //
@@ -17,8 +75,8 @@ type FinsTCPClient struct {
 
 	conn      net.Conn
 	mutex     sync.RWMutex
-	stats     ConnectionStats
 	closed    bool
+	status    ConnectionStatus
 	closeChan chan struct{}
 
 	// 节点号（握手后得到；若握手返回 0 则回退到 config）
@@ -27,25 +85,58 @@ type FinsTCPClient struct {
 
 	// SID 生成与 pending 映射（复用 UDP 的思路）
 	sequenceNo  uint16
-	currentSID  byte
 	pendingReqs map[byte]*PendingRequest
+
+	// TCP 内建后台重连状态
+	reconnectPolicy  *TCPReconnectPolicy
+	reconnecting     bool
+	reconnectStopCh  chan struct{}
+	lastReconnectErr error
 }
 
-// NewTCPClient 创建TCP客户端
+// NewTCPClient 创建 TCP 客户端。
 func NewTCPClient(config *FinsClientConfig) (*FinsTCPClient, error) {
+	return NewTCPClientWithReconnect(config, nil)
+}
+
+// NewTCPClientWithReconnect 创建带 TCP 内建重连策略的客户端。
+func NewTCPClientWithReconnect(config *FinsClientConfig, policy *TCPReconnectPolicy) (*FinsTCPClient, error) {
 	if config == nil {
 		return nil, fmt.Errorf("配置不能为空")
 	}
 
 	client := &FinsTCPClient{
-		config:      config,
-		closeChan:   make(chan struct{}),
-		sequenceNo:  uint16(config.StartSID),
-		currentSID:  config.FixedSID,
-		pendingReqs: make(map[byte]*PendingRequest),
+		config:           config,
+		status:           ConnectionStatusDisconnected,
+		closeChan:        make(chan struct{}),
+		sequenceNo:       uint16(config.StartSID),
+		pendingReqs:      make(map[byte]*PendingRequest),
+		reconnectPolicy:  cloneTCPReconnectPolicy(policy),
+		lastReconnectErr: nil,
 	}
 
 	return client, nil
+}
+
+// SetReconnectPolicy 设置 TCP 内建重连策略。
+func (c *FinsTCPClient) SetReconnectPolicy(policy *TCPReconnectPolicy) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.reconnectPolicy = cloneTCPReconnectPolicy(policy)
+}
+
+func (c *FinsTCPClient) setStatusLocked(status ConnectionStatus) {
+	c.status = status
+	if status == ConnectionStatusClosed {
+		c.closed = true
+	}
+}
+
+// GetConnectionStatus 获取连接状态。
+func (c *FinsTCPClient) GetConnectionStatus() ConnectionStatus {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.status
 }
 
 // Connect 连接到服务器
@@ -59,26 +150,35 @@ func NewTCPClient(config *FinsClientConfig) (*FinsTCPClient, error) {
 func (c *FinsTCPClient) Connect() error {
 	// 1) 建立 TCP 连接
 	c.mutex.Lock()
+	if c.closed {
+		c.mutex.Unlock()
+		return ErrConnectionClosed
+	}
 	if c.conn != nil {
 		c.mutex.Unlock()
 		return fmt.Errorf("已经连接")
+	}
+	if c.reconnecting {
+		c.setStatusLocked(ConnectionStatusReconnecting)
+	} else {
+		c.setStatusLocked(ConnectionStatusConnecting)
 	}
 
 	addr := fmt.Sprintf("%v:%d", c.config.IP, c.config.Port)
 	conn, err := net.DialTimeout("tcp", addr, c.config.Timeout)
 	if err != nil {
+		c.setStatusLocked(ConnectionStatusDisconnected)
 		c.mutex.Unlock()
 		return fmt.Errorf("连接失败: %w", err)
 	}
 
 	c.conn = conn
-	c.closed = false
 	c.mutex.Unlock()
 
 	// 2) 握手（同步完成，避免 receiveLoop 抢读）
 	localNode, serverNode, err := c.handshake(conn)
 	if err != nil {
-		_ = c.Close()
+		c.handleConnectionFailure(conn)
 		return err
 	}
 
@@ -86,10 +186,13 @@ func (c *FinsTCPClient) Connect() error {
 	c.mutex.Lock()
 	c.localNode = resolveLocalNode(c.config.LocalNode, localNode, conn)
 	c.serverNode = resolveServerNode(c.config.ServerNode, serverNode)
+	c.lastReconnectErr = nil
+	c.setStatusLocked(ConnectionStatusConnected)
+	currentCloseChan := c.closeChan
 	c.mutex.Unlock()
 
 	// 4) 启动接收协程
-	go c.receiveLoop()
+	go c.receiveLoop(conn, currentCloseChan)
 
 	return nil
 }
@@ -103,22 +206,20 @@ func (c *FinsTCPClient) Close() error {
 		return nil
 	}
 
-	c.closed = true
-	close(c.closeChan)
+	c.setStatusLocked(ConnectionStatusClosed)
+	if c.reconnectStopCh != nil {
+		close(c.reconnectStopCh)
+		c.reconnectStopCh = nil
+	}
+	c.signalConnectionEventLocked()
 
 	if c.conn != nil {
 		_ = c.conn.Close()
 		c.conn = nil
 	}
 
-	// 清理待处理请求
-	for sid, req := range c.pendingReqs {
-		close(req.Response)
-		delete(c.pendingReqs, sid)
-	}
-
-	// 创建新的 closeChan，允许重连
-	c.closeChan = make(chan struct{})
+	c.clearPendingRequestsLocked()
+	c.lastReconnectErr = ErrConnectionClosed
 
 	return nil
 }
@@ -139,38 +240,225 @@ func (c *FinsTCPClient) getNextSID() byte {
 	}
 }
 
-// SendRequest 发送请求
-func (c *FinsTCPClient) SendRequest(command uint16, data []byte) (*FinsResponse, error) {
-	c.mutex.Lock()
-	if c.closed {
-		c.mutex.Unlock()
-		return nil, ErrConnectionClosed
+func (c *FinsTCPClient) clearPendingRequestsLocked() {
+	for sid := range c.pendingReqs {
+		delete(c.pendingReqs, sid)
 	}
-	conn := c.conn
-	if conn == nil {
+}
+
+func (c *FinsTCPClient) signalConnectionEventLocked() {
+	select {
+	case <-c.closeChan:
+	default:
+		close(c.closeChan)
+	}
+	c.closeChan = make(chan struct{})
+}
+
+func (c *FinsTCPClient) handleConnectionFailure(failedConn net.Conn) {
+	shouldStartReconnect := false
+
+	c.mutex.Lock()
+	if failedConn != nil && c.conn != nil && c.conn != failedConn {
 		c.mutex.Unlock()
-		return nil, ErrConnectionClosed
+		return
+	}
+
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+
+	if !c.closed {
+		c.signalConnectionEventLocked()
+		if c.reconnectPolicy != nil && c.reconnectPolicy.EnableAutoReconnect {
+			c.setStatusLocked(ConnectionStatusReconnecting)
+			shouldStartReconnect = true
+		} else {
+			c.setStatusLocked(ConnectionStatusDisconnected)
+		}
+	}
+	c.clearPendingRequestsLocked()
+	c.mutex.Unlock()
+
+	if shouldStartReconnect {
+		c.ensureReconnectLoop()
+	}
+}
+
+func (c *FinsTCPClient) getReconnectPolicy() *TCPReconnectPolicy {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return cloneTCPReconnectPolicy(c.reconnectPolicy)
+}
+
+func (c *FinsTCPClient) shouldReconnectOnError(err error) bool {
+	policy := c.getReconnectPolicy()
+	if policy == nil {
+		return false
+	}
+	if !policy.EnableAutoReconnect {
+		return false
+	}
+	return isTCPConnectionError(err)
+}
+
+func (c *FinsTCPClient) ensureReconnectLoop() {
+	policy := c.getReconnectPolicy()
+	if policy == nil || !policy.EnableAutoReconnect {
+		return
+	}
+
+	c.mutex.Lock()
+	if c.closed || c.reconnecting || c.conn != nil {
+		c.mutex.Unlock()
+		return
+	}
+	c.reconnecting = true
+	c.lastReconnectErr = nil
+	stopCh := make(chan struct{})
+	c.reconnectStopCh = stopCh
+	c.setStatusLocked(ConnectionStatusReconnecting)
+	c.mutex.Unlock()
+
+	go c.reconnectLoop(stopCh)
+}
+
+func (c *FinsTCPClient) reconnectLoop(stopCh chan struct{}) {
+	policy := c.getReconnectPolicy()
+	if policy == nil || !policy.EnableAutoReconnect {
+		c.mutex.Lock()
+		c.reconnecting = false
+		if c.conn == nil && !c.closed {
+			c.setStatusLocked(ConnectionStatusDisconnected)
+		}
+		c.mutex.Unlock()
+		return
+	}
+
+	delay := policy.InitialDelay
+	attempt := 0
+	var reconnectErr error
+
+	for {
+		attempt++
+		reconnectErr = c.Connect()
+		if reconnectErr == nil {
+			c.mutex.Lock()
+			c.reconnecting = false
+			c.reconnectStopCh = nil
+			c.lastReconnectErr = nil
+			c.mutex.Unlock()
+			return
+		}
+
+		c.mutex.Lock()
+		c.lastReconnectErr = reconnectErr
+		if c.closed {
+			c.reconnecting = false
+			c.reconnectStopCh = nil
+			c.mutex.Unlock()
+			return
+		}
+		if policy.MaxReconnectAttempts > 0 && attempt >= policy.MaxReconnectAttempts {
+			attempt = 0
+			delay = policy.MaxDelay
+		}
+		c.mutex.Unlock()
+
+		select {
+		case <-stopCh:
+			c.mutex.Lock()
+			c.reconnecting = false
+			c.reconnectStopCh = nil
+			if c.conn == nil && !c.closed {
+				c.setStatusLocked(ConnectionStatusDisconnected)
+			}
+			c.mutex.Unlock()
+			return
+		case <-time.After(delay):
+		}
+
+		delay = time.Duration(float64(delay) * policy.BackoffFactor)
+		if delay > policy.MaxDelay {
+			delay = policy.MaxDelay
+		}
+	}
+}
+
+func isTCPConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrConnectionClosed) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && !netErr.Timeout() {
+		return true
+	}
+
+	errText := strings.ToLower(err.Error())
+	connectionMarkers := []string{
+		"eof",
+		"broken pipe",
+		"connection reset",
+		"connection refused",
+		"closed network connection",
+		"use of closed network connection",
+		"连接已关闭",
+		"发送失败",
+		"读取失败",
+	}
+	for _, marker := range connectionMarkers {
+		if strings.Contains(errText, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *FinsTCPClient) sendRequestOnce(command uint16, data []byte) (*FinsResponse, error) {
+	conn, req, closeChan, err := c.prepareTCPRequest(command, data)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = conn.Write(req.Request); err != nil {
+		c.handleTCPWriteFailure(conn, req.SID)
+		return nil, fmt.Errorf("发送失败: %w", err)
+	}
+
+	return c.waitTCPResponse(req, closeChan)
+}
+
+func (c *FinsTCPClient) prepareTCPRequest(command uint16, data []byte) (net.Conn, *PendingRequest, chan struct{}, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.closed {
+		return nil, nil, nil, ErrConnectionClosed
+	}
+
+	conn := c.conn
+	if c.status != ConnectionStatusConnected || conn == nil {
+		return nil, nil, nil, ErrNotConnected
 	}
 
 	sid := c.getNextSID()
-
-	// 构建“内层”FINS 请求（复用 UDP 的帧格式）
 	inner := NewUDPRequestFrame(c.localNode, c.serverNode, sid, command, data)
 	innerBytes, err := BuildUDPFrame(inner)
 	if err != nil {
-		c.mutex.Unlock()
-		return nil, fmt.Errorf("构建内层FINS帧失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("构建内层FINS帧失败: %w", err)
 	}
 
-	// 构建“外层”FINS/TCP 帧（0x00000002；请求/响应命令码相同）
 	outer := NewTCPRequestFrame(TCPCommandFinsFrame, innerBytes)
 	outerBytes, err := BuildTCPFrame(outer)
 	if err != nil {
-		c.mutex.Unlock()
-		return nil, fmt.Errorf("构建外层TCP帧失败: %w", err)
+		return nil, nil, nil, fmt.Errorf("构建外层TCP帧失败: %w", err)
 	}
 
-	// 创建待处理请求
 	req := &PendingRequest{
 		SID:       sid,
 		Request:   outerBytes,
@@ -178,124 +466,148 @@ func (c *FinsTCPClient) SendRequest(command uint16, data []byte) (*FinsResponse,
 		Response:  make(chan *FinsResponse, 1),
 	}
 	c.pendingReqs[sid] = req
-	c.mutex.Unlock()
+	return conn, req, c.closeChan, nil
+}
 
-	// 发送数据
-	_, err = conn.Write(outerBytes)
-	if err != nil {
-		c.mutex.Lock()
-		delete(c.pendingReqs, sid)
-		c.mutex.Unlock()
-		return nil, fmt.Errorf("发送失败: %w", err)
-	}
+func (c *FinsTCPClient) handleTCPWriteFailure(conn net.Conn, sid byte) {
+	c.removePendingRequest(sid)
+	c.handleConnectionFailure(conn)
+}
 
-	c.stats.TotalRequests++
-	c.stats.LastRequestAt = time.Now()
+func (c *FinsTCPClient) waitTCPResponse(req *PendingRequest, closeChan chan struct{}) (*FinsResponse, error) {
+	timer := time.NewTimer(c.config.Timeout)
+	defer timer.Stop()
 
-	// 等待响应或超时
 	select {
 	case resp := <-req.Response:
-		c.stats.LastResponseAt = time.Now()
-		if resp.IsSuccess() {
-			c.stats.SuccessCount++
-		} else {
-			c.stats.ErrorCount++
+		if resp == nil {
+			return nil, ErrConnectionClosed
 		}
 		return resp, nil
-	case <-time.After(c.config.Timeout):
-		c.mutex.Lock()
-		delete(c.pendingReqs, sid)
-		c.mutex.Unlock()
-		c.stats.TimeoutCount++
+	case <-timer.C:
+		c.removePendingRequest(req.SID)
 		return nil, ErrTimeout
-	case <-c.closeChan:
+	case <-closeChan:
+		c.removePendingRequest(req.SID)
 		return nil, ErrConnectionClosed
 	}
 }
 
+func (c *FinsTCPClient) removePendingRequest(sid byte) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	delete(c.pendingReqs, sid)
+}
+
+// SendRequest 发送请求。
+//
+// 当启用自动重连时：
+//   - 连接异常由后台协程自动恢复
+//   - 重连期间新请求直接返回未连接错误
+//   - 不阻塞等待重连完成，也不自动重发当前请求
+func (c *FinsTCPClient) SendRequest(command uint16, data []byte) (*FinsResponse, error) {
+	resp, err := c.sendRequestOnce(command, data)
+	if err == nil {
+		return resp, nil
+	}
+	if c.shouldReconnectOnError(err) {
+		c.ensureReconnectLoop()
+		return nil, ErrNotConnected
+	}
+	return nil, err
+}
+
 // receiveLoop 接收循环
-func (c *FinsTCPClient) receiveLoop() {
+func (c *FinsTCPClient) receiveLoop(conn net.Conn, closeChan chan struct{}) {
 	for {
 		select {
-		case <-c.closeChan:
+		case <-closeChan:
 			return
 		default:
 		}
 
-		c.mutex.RLock()
-		conn := c.conn
-		closed := c.closed
-		c.mutex.RUnlock()
-		if closed || conn == nil {
+		if !c.isReceiveConnActive(conn) {
 			return
 		}
 
-		// 设置读取超时，便于响应 closeChan
 		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-
 		frameData, err := ReadTCPFrameFromConn(func(buf []byte) (int, error) {
 			return io.ReadFull(conn, buf)
 		})
 		if err != nil {
-			// 读取超时：继续循环检查 closeChan
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			if c.handleTCPReceiveError(conn, err) {
 				continue
-			}
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return
-			}
-			if !closed {
-				fmt.Printf("读取帧失败: %v\n", err)
 			}
 			return
 		}
 
-		outer, err := ParseTCPFrame(frameData)
+		resp, err := c.parseTCPResponseFrame(frameData)
 		if err != nil {
-			fmt.Printf("解析TCP帧失败: %v\n", err)
-			continue
-		}
-
-		// 只处理正常读写帧（0x00000002；请求/响应命令码相同）
-		if outer.Command != TCPCommandFinsFrame {
-			continue
-		}
-
-		resp, err := ParseUDPResponse(outer.Data)
-		if err != nil {
-			fmt.Printf("解析内层FINS响应失败: %v\n", err)
-			continue
-		}
-
-		// 命中 pending 并投递
-		c.mutex.Lock()
-		req, exists := c.pendingReqs[resp.SID]
-		if exists {
-			delete(c.pendingReqs, resp.SID)
-		}
-		c.mutex.Unlock()
-
-		if exists {
-			select {
-			case req.Response <- resp:
-			default:
+			if err != ErrInvalidResponse {
+				fmt.Printf("解析TCP响应失败: %v\n", err)
 			}
+			continue
 		}
+
+		c.deliverPendingResponse(resp)
 	}
 }
 
-// GetStats 获取统计信息
-func (c *FinsTCPClient) GetStats() ConnectionStats {
+func (c *FinsTCPClient) isReceiveConnActive(conn net.Conn) bool {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
-	return c.stats
+	return !c.closed && c.conn != nil && c.conn == conn
+}
+
+func (c *FinsTCPClient) handleTCPReceiveError(conn net.Conn, err error) bool {
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		return true
+	}
+	if err == io.EOF || err == io.ErrUnexpectedEOF || isTCPConnectionError(err) {
+		c.handleConnectionFailure(conn)
+		return false
+	}
+
+	c.mutex.RLock()
+	closed := c.closed
+	c.mutex.RUnlock()
+	if !closed {
+		fmt.Printf("读取帧失败: %v\n", err)
+	}
+	return false
+}
+
+func (c *FinsTCPClient) parseTCPResponseFrame(frameData []byte) (*FinsResponse, error) {
+	outer, err := ParseTCPFrame(frameData)
+	if err != nil {
+		return nil, err
+	}
+	if outer.Command != TCPCommandFinsFrame {
+		return nil, ErrInvalidResponse
+	}
+	return ParseUDPResponse(outer.Data)
+}
+
+func (c *FinsTCPClient) deliverPendingResponse(resp *FinsResponse) {
+	c.mutex.Lock()
+	req, exists := c.pendingReqs[resp.SID]
+	if exists {
+		delete(c.pendingReqs, resp.SID)
+	}
+	c.mutex.Unlock()
+	if !exists {
+		return
+	}
+
+	select {
+	case req.Response <- resp:
+	default:
+	}
 }
 
 // IsConnected 检查是否已连接
 func (c *FinsTCPClient) IsConnected() bool {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-	return c.conn != nil && !c.closed
+	return c.GetConnectionStatus() == ConnectionStatusConnected
 }
 
 // handshake 执行握手请求/响应（0x00000000/0x00000001），返回 (localNode, serverNode)

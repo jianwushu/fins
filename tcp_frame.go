@@ -106,22 +106,6 @@ func NewTCPRequestFrame(command uint32, data []byte) *FinsTCPFrame {
 	}
 }
 
-// ParseTCPResponse 解析 FINS/TCP 的正常读写帧（外层 0x00000002；请求/响应命令码相同）
-//
-// 返回值为“内层”FINS 响应（SID/StatusCode/Data）。
-func ParseTCPResponse(data []byte) (*FinsResponse, error) {
-	frame, err := ParseTCPFrame(data)
-	if err != nil {
-		return nil, err
-	}
-
-	if frame.Command != TCPCommandFinsFrame {
-		return nil, ErrInvalidResponse
-	}
-
-	return ParseUDPResponse(frame.Data)
-}
-
 // ReadTCPFrameFromConn 从连接中读取完整的 FINS/TCP 外层帧
 //
 // FINS/TCP 的 Length 表示后续字节数（Command+ErrorCode+Data），因此总帧长为 8 + Length。

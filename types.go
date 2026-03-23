@@ -11,11 +11,46 @@ var (
 	ErrInvalidFrame      = errors.New("无效的帧数据")
 	ErrInvalidMagic      = errors.New("无效的魔数")
 	ErrConnectionClosed  = errors.New("连接已关闭")
+	ErrNotConnected      = errors.New("当前未连接")
 	ErrInvalidResponse   = errors.New("无效的响应")
 	ErrInvalidSID        = errors.New("无效的SID")
 	ErrInvalidAddress    = errors.New("无效的地址")
 	ErrInvalidDataLength = errors.New("无效的数据长度")
 )
+
+// ConnectionStatus 表示客户端连接状态。
+type ConnectionStatus int
+
+const (
+	// ConnectionStatusClosed 表示客户端已显式关闭，不再参与重连。
+	ConnectionStatusClosed ConnectionStatus = iota
+	// ConnectionStatusDisconnected 表示当前未连接，但客户端仍可重新发起连接。
+	ConnectionStatusDisconnected
+	// ConnectionStatusConnecting 表示正在执行首次连接。
+	ConnectionStatusConnecting
+	// ConnectionStatusConnected 表示连接已建立且可正常收发。
+	ConnectionStatusConnected
+	// ConnectionStatusReconnecting 表示连接异常断开后正在后台自动重连。
+	ConnectionStatusReconnecting
+)
+
+// String 返回连接状态的可读文本。
+func (s ConnectionStatus) String() string {
+	switch s {
+	case ConnectionStatusClosed:
+		return "closed"
+	case ConnectionStatusDisconnected:
+		return "disconnected"
+	case ConnectionStatusConnecting:
+		return "connecting"
+	case ConnectionStatusConnected:
+		return "connected"
+	case ConnectionStatusReconnecting:
+		return "reconnecting"
+	default:
+		return "unknown"
+	}
+}
 
 // FinsClientConfig FINS客户端配置
 type FinsClientConfig struct {
@@ -133,14 +168,4 @@ type PendingRequest struct {
 	Request   []byte             // 请求数据
 	CreatedAt time.Time          // 创建时间
 	Response  chan *FinsResponse // 响应通道
-}
-
-// ConnectionStats 连接统计信息
-type ConnectionStats struct {
-	TotalRequests  uint64    // 总请求数
-	SuccessCount   uint64    // 成功次数
-	ErrorCount     uint64    // 错误次数
-	TimeoutCount   uint64    // 超时次数
-	LastRequestAt  time.Time // 最后请求时间
-	LastResponseAt time.Time // 最后响应时间
 }
