@@ -47,9 +47,9 @@ func NewUDPClient(config *FinsClientConfig) (*FinsUDPClient, error) {
 // Connect 连接到服务器
 func (c *FinsUDPClient) Connect() error {
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
 
 	if c.conn != nil {
+		c.mutex.Unlock()
 		return fmt.Errorf("已经连接")
 	}
 
@@ -60,15 +60,31 @@ func (c *FinsUDPClient) Connect() error {
 	conn, err := net.DialUDP("udp", nil, c.serverAddr)
 	if err != nil {
 		c.status = ConnectionStatusDisconnected
+		c.mutex.Unlock()
 		return fmt.Errorf("连接失败: %w", err)
 	}
 
 	c.conn = conn
 	c.closed = false
-	c.status = ConnectionStatusConnected
+	currentCloseChan := c.closeChan
+	c.mutex.Unlock()
 
 	// 启动接收协程
 	go c.receiveLoop()
+
+	err = c.probeConnection(currentCloseChan)
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if err != nil {
+		c.closeAfterProbeFailureLocked(conn)
+		return fmt.Errorf("连接探测失败: %w", err)
+	}
+
+	if c.conn == conn && !c.closed {
+		c.status = ConnectionStatusConnected
+	}
 
 	return nil
 }
@@ -128,45 +144,83 @@ func (c *FinsUDPClient) getNextSID() byte {
 
 // SendRequest 发送请求
 func (c *FinsUDPClient) SendRequest(command uint16, data []byte) (*FinsResponse, error) {
-	conn, req, closeChan, err := c.prepareRequest(command, data)
+	conn, req, closeChan, err := c.prepareConnectedRequest(command, data)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err = conn.Write(req.Request); err != nil {
-		c.handleSendFailure(req.SID)
-		return nil, fmt.Errorf("发送失败: %w", err)
+	if err = c.writePendingRequest(conn, req); err != nil {
+		return nil, err
 	}
 
 	return c.waitForResponse(req, closeChan)
 }
 
-func (c *FinsUDPClient) prepareRequest(command uint16, data []byte) (*net.UDPConn, *PendingRequest, chan struct{}, error) {
+func (c *FinsUDPClient) prepareConnectedRequest(command uint16, data []byte) (*net.UDPConn, *PendingRequest, chan struct{}, error) {
+	return c.prepareRequest(command, data, true)
+}
+
+func (c *FinsUDPClient) prepareProbeRequest(command uint16, data []byte) (*net.UDPConn, *PendingRequest, chan struct{}, error) {
+	return c.prepareRequest(command, data, false)
+}
+
+func (c *FinsUDPClient) prepareRequest(command uint16, data []byte, requireConnected bool) (*net.UDPConn, *PendingRequest, chan struct{}, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.closed {
-		return nil, nil, nil, ErrConnectionClosed
-	}
-	if c.status != ConnectionStatusConnected || c.conn == nil {
-		return nil, nil, nil, ErrNotConnected
+	conn, closeChan, err := c.getRequestContextLocked(requireConnected)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
+	req, err := c.buildPendingRequestLocked(command, data)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	c.registerPendingRequestLocked(req)
+	return conn, req, closeChan, nil
+}
+
+func (c *FinsUDPClient) getRequestContextLocked(requireConnected bool) (*net.UDPConn, chan struct{}, error) {
+	if c.closed {
+		return nil, nil, ErrConnectionClosed
+	}
+	if c.conn == nil {
+		return nil, nil, ErrNotConnected
+	}
+	if requireConnected && c.status != ConnectionStatusConnected {
+		return nil, nil, ErrNotConnected
+	}
+	return c.conn, c.closeChan, nil
+}
+
+func (c *FinsUDPClient) buildPendingRequestLocked(command uint16, data []byte) (*PendingRequest, error) {
 	sid := c.getNextSID()
 	frame := NewUDPRequestFrame(c.config.LocalNode, c.config.ServerNode, sid, command, data)
 	frameData, err := BuildUDPFrame(frame)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("构建帧失败: %w", err)
+		return nil, fmt.Errorf("构建帧失败: %w", err)
 	}
 
-	req := &PendingRequest{
+	return &PendingRequest{
 		SID:       sid,
 		Request:   frameData,
 		CreatedAt: time.Now(),
 		Response:  make(chan *FinsResponse, 1),
+	}, nil
+}
+
+func (c *FinsUDPClient) registerPendingRequestLocked(req *PendingRequest) {
+	c.pendingReqs[req.SID] = req
+}
+
+func (c *FinsUDPClient) writePendingRequest(conn *net.UDPConn, req *PendingRequest) error {
+	if _, err := conn.Write(req.Request); err != nil {
+		c.handleSendFailure(req.SID)
+		return fmt.Errorf("发送失败: %w", err)
 	}
-	c.pendingReqs[sid] = req
-	return c.conn, req, c.closeChan, nil
+	return nil
 }
 
 func (c *FinsUDPClient) handleSendFailure(sid byte) {
@@ -199,6 +253,56 @@ func (c *FinsUDPClient) removePendingRequest(sid byte) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	delete(c.pendingReqs, sid)
+}
+
+func (c *FinsUDPClient) probeConnection(closeChan chan struct{}) error {
+	resp, err := c.sendProbeReadD0(closeChan)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return ErrInvalidResponse
+	}
+	if !resp.IsSuccess() {
+		return fmt.Errorf("读取 D0 失败: %s (0x%04X)", resp.GetErrorMessage(), resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *FinsUDPClient) sendProbeReadD0(closeChan chan struct{}) (*FinsResponse, error) {
+	req := &ReadRequest{
+		AreaCode: MemAreaD,
+		Address:  0,
+		BitNo:    0,
+		DataType: DataTypeWord,
+		Count:    1,
+	}
+
+	data := BuildReadMemoryRequest(req)
+	conn, pendingReq, _, err := c.prepareProbeRequest(CmdMemoryRead, data)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = c.writePendingRequest(conn, pendingReq); err != nil {
+		return nil, fmt.Errorf("发送 D0 探测失败: %w", err)
+	}
+
+	resp, err := c.waitForResponse(pendingReq, closeChan)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *FinsUDPClient) closeAfterProbeFailureLocked(conn *net.UDPConn) {
+	if c.conn == conn {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+	c.status = ConnectionStatusDisconnected
+	c.signalCloseLocked()
+	c.clearPendingRequestsLocked()
 }
 
 // receiveLoop 接收循环
